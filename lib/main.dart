@@ -76,6 +76,7 @@ class _MovesenseHomePageState extends State<MovesenseHomePage> {
   BluetoothDevice? _device;
   BluetoothCharacteristic? _writeChar;
   BluetoothCharacteristic? _notifyChar;
+  BluetoothCharacteristic? _hrChar;
 
   bool _isScanning = false;
   bool _isConnected = false;
@@ -105,30 +106,56 @@ class _MovesenseHomePageState extends State<MovesenseHomePage> {
   Future<void> _startScan() async {
     if (_isScanning) return;
 
+    final adapterState = await FlutterBluePlus.adapterState.first;
+    _log('Adapter state before scan: $adapterState');
+
+    if (adapterState != BluetoothAdapterState.on) {
+      _log('Bluetooth is not ON, scan aborted');
+      return;
+    }
+
     _log('Starting BLE scan...');
     _scanResults.clear();
     setState(() => _isScanning = true);
 
+    await _scanSub?.cancel();
     await FlutterBluePlus.stopScan();
 
-    _scanSub = FlutterBluePlus.scanResults.listen((results) {
-      for (final r in results) {
-        final name = r.device.platformName;
-        if (name.toLowerCase().contains('movesense')) {
-          _scanResults[r.device.remoteId.str] = r;
+    _scanSub = FlutterBluePlus.scanResults.listen(
+      (results) {
+        for (final r in results) {
+          final name = r.device.platformName.trim();
+          if (name.toLowerCase().contains('movesense')) {
+            _scanResults[r.device.remoteId.str] = r;
+            _log(
+              'FOUND name="${r.device.platformName}" '
+              'id=${r.device.remoteId.str} rssi=${r.rssi}',
+            );
+          }
         }
-      }
-      if (mounted) setState(() {});
-    });
+        if (mounted) setState(() {});
+      },
+      onError: (e) {
+        _log('scanResults stream error: $e');
+      },
+    );
 
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
+    try {
+      await FlutterBluePlus.startScan(
+        timeout: const Duration(seconds: 8),
+        androidUsesFineLocation: true,
+      );
+      _log('startScan call succeeded');
+    } catch (e) {
+      _log('startScan failed: $e');
+      setState(() => _isScanning = false);
+      return;
+    }
 
     Future.delayed(const Duration(seconds: 8), () {
       if (!mounted) return;
       setState(() => _isScanning = false);
-      _log(
-        'Scan finished. Found ${_scanResults.length} Movesense-like device(s).',
-      );
+      _log('Scan finished. Found ${_scanResults.length} device(s).');
     });
   }
 
@@ -141,8 +168,13 @@ class _MovesenseHomePageState extends State<MovesenseHomePage> {
 
   Future<void> _connect(BluetoothDevice device) async {
     try {
+      await _stopScan();
       _log('Connecting to ${device.platformName} (${device.remoteId.str})');
+
       _device = device;
+      _writeChar = null;
+      _notifyChar = null;
+      _hrChar = null;
 
       _connStateSub?.cancel();
       _connStateSub = device.connectionState.listen((state) {
@@ -155,34 +187,55 @@ class _MovesenseHomePageState extends State<MovesenseHomePage> {
         license: License.free,
         timeout: const Duration(seconds: 12),
       );
+
       final services = await device.discoverServices();
       _log('Discovered ${services.length} service(s)');
 
       for (final service in services) {
-        if (service.uuid == gspServiceUuid) {
+        _log('SERVICE ${service.uuid}');
+        for (final c in service.characteristics) {
+          _log(
+            '  CHAR ${c.uuid} '
+            'read=${c.properties.read} '
+            'write=${c.properties.write} '
+            'writeNoResp=${c.properties.writeWithoutResponse} '
+            'notify=${c.properties.notify}',
+          );
+        }
+      }
+
+      for (final service in services) {
+        final serviceUuid = service.uuid.toString().toLowerCase();
+
+        if (serviceUuid == '0000180d-0000-1000-8000-00805f9b34fb' ||
+            serviceUuid == '180d') {
           for (final c in service.characteristics) {
-            if (c.uuid == gspWriteUuid) _writeChar = c;
-            if (c.uuid == gspNotifyUuid) _notifyChar = c;
+            final charUuid = c.uuid.toString().toLowerCase();
+
+            if (charUuid == '00002a37-0000-1000-8000-00805f9b34fb' ||
+                charUuid == '2a37') {
+              _hrChar = c;
+            }
           }
         }
       }
 
-      if (_writeChar == null || _notifyChar == null) {
+      if (_hrChar == null) {
         _log(
-          'ERROR: GSP service found? ${services.any((s) => s.uuid == gspServiceUuid)}',
+          'ERROR: Could not find Heart Rate Measurement characteristic (2A37)',
         );
-        _log('ERROR: Could not find required GSP write/notify characteristics');
         return;
       }
 
-      await _notifyChar!.setNotifyValue(true);
-      _notifySub?.cancel();
-      _notifySub = _notifyChar!.lastValueStream.listen((data) {
-        _handleNotification(data);
+      await _notifySub?.cancel();
+      await _hrChar!.setNotifyValue(true);
+      _notifySub = _hrChar!.lastValueStream.listen((data) {
+        if (data.isNotEmpty) {
+          _handleNotification(data);
+        }
       });
 
-      _log('Connected and notification channel ready');
-      await _sendHello();
+      _log('Connected and HR notification ready');
     } catch (e) {
       _log('Connect error: $e');
     }
@@ -280,19 +333,36 @@ class _MovesenseHomePageState extends State<MovesenseHomePage> {
   void _handleNotification(List<int> data) {
     if (data.isEmpty) return;
 
-    final code = data[0];
-    if (code == 0x01) {
-      _parseCommandResponse(data);
-      return;
-    }
+    // Standard BLE Heart Rate Measurement parsing
+    // Byte 0 = flags
+    // If bit0 == 0 => HR is uint8 at byte 1
+    // If bit0 == 1 => HR is uint16 at bytes 1-2
+    if (_hrChar != null) {
+      try {
+        final flags = data[0];
+        final isUint16 = (flags & 0x01) != 0;
 
-    if (code == 0x02 || code == 0x03) {
-      final ref = data.length > 1 ? data[1] : -1;
-      final payload = data.length > 2 ? data.sublist(2) : <int>[];
-      _log(
-        'RX DATA(code=$code ref=$ref len=${payload.length}) hex=${_hex(payload)} ascii=${_asciiPreview(payload)}',
-      );
-      return;
+        int hr;
+        if (isUint16) {
+          if (data.length < 3) {
+            _log('HR packet too short: ${_hex(data)}');
+            return;
+          }
+          hr = data[1] | (data[2] << 8);
+        } else {
+          if (data.length < 2) {
+            _log('HR packet too short: ${_hex(data)}');
+            return;
+          }
+          hr = data[1];
+        }
+
+        _log('HR = $hr bpm   raw=${_hex(data)}');
+        return;
+      } catch (e) {
+        _log('HR parse error: $e   raw=${_hex(data)}');
+        return;
+      }
     }
 
     _log('RX UNKNOWN ${_hex(data)}');
